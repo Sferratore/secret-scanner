@@ -4,12 +4,21 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/bl4ckw1ng/secret-scanner/models"
 	"github.com/google/uuid"
+)
+
+// falsePositivePattern matches lines that are clearly code defining patterns,
+// not actual secrets (e.g. regexp definitions, test fixtures, comments).
+var falsePositivePattern = regexp.MustCompile(
+	`(?i)regexp\.MustCompile|regexp\.Compile|re\.compile|Pattern\s*=|PATTERN\s*=|` +
+		`//\s*|#\s*example|#\s*sample|test.*key|fake.*key|dummy.*key|` +
+		`example\.com|sample\.com|foo\.com|localhost`,
 )
 
 // dedupeKey uniquely identifies a secret so we don't report duplicates.
@@ -86,6 +95,11 @@ func scanContent(entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
 
 				// Skip placeholders
 				if IsPlaceholder(raw) {
+					continue
+				}
+
+				// Skip lines that are clearly regex/code definitions, not real secrets
+				if falsePositivePattern.MatchString(line) {
 					continue
 				}
 
