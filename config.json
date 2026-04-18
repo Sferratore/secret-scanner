@@ -1,0 +1,8 @@
+{
+  "port": "8080",
+  "allowed_origins": ["*"],
+  "allowed_methods": ["GET", "POST", "OPTIONS"],
+  "allowed_headers": ["Content-Type", "Authorization"],
+  "scan_timeout_secs": 300,
+  "max_file_size_mb": 1
+}
