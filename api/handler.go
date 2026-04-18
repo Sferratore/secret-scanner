@@ -4,39 +4,108 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bl4ckw1ng/secret-scanner/models"
 	"github.com/bl4ckw1ng/secret-scanner/scanner"
 	"github.com/gin-gonic/gin"
 )
 
-const scanTimeout = 5 * time.Minute
+const (
+	scanTimeout = 5 * time.Minute
+	maxURLLen   = 256
+	maxBodySize = 1024 // 1 KB — a repo_url JSON doesn't need more
+)
 
-// githubURLPattern validates GitHub repository URLs.
+// githubURLPattern validates GitHub repository URLs after all other checks pass.
 var githubURLPattern = regexp.MustCompile(
 	`^https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(?:\.git)?/?$`,
 )
 
+// sanitizeURL validates and cleans the incoming repo URL against injection attacks.
+func sanitizeURL(raw string) (string, string) {
+	// 1. Length check — no legitimate GitHub URL exceeds this
+	if len(raw) > maxURLLen {
+		return "", "URL too long"
+	}
+
+	// 2. Reject non-ASCII characters (homoglyph / unicode attacks)
+	for _, r := range raw {
+		if r > unicode.MaxASCII {
+			return "", "URL contains invalid characters"
+		}
+	}
+
+	// 3. Reject null bytes
+	if strings.ContainsRune(raw, '\x00') {
+		return "", "URL contains invalid characters"
+	}
+
+	// 4. Parse as a proper URL — catches malformed schemes, encoded tricks
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", "invalid URL format"
+	}
+
+	// 5. Scheme must be exactly https
+	if parsed.Scheme != "https" {
+		return "", "only HTTPS URLs are allowed"
+	}
+
+	// 6. Host must be exactly github.com — blocks IP addresses, subdomains, lookalikes
+	if parsed.Host != "github.com" {
+		return "", "only github.com repositories are supported"
+	}
+
+	// 7. No userinfo (user:pass@github.com)
+	if parsed.User != nil {
+		return "", "URL must not contain credentials"
+	}
+
+	// 8. No query params or fragments — not valid for git clone
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", "URL must not contain query parameters or fragments"
+	}
+
+	// 9. Path traversal check on the decoded path
+	if strings.Contains(parsed.Path, "..") {
+		return "", "URL contains invalid path"
+	}
+
+	// 10. Reconstruct a clean URL from parsed components (strips encoded tricks)
+	clean := "https://github.com" + parsed.Path
+
+	// 11. Final regex check on the clean URL
+	if !githubURLPattern.MatchString(clean) {
+		return "", "invalid GitHub URL"
+	}
+
+	return clean, ""
+}
+
 // ScanHandler handles POST /api/scan
 func ScanHandler(c *gin.Context) {
+	// Limit request body size
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodySize)
+
 	var req models.ScanRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "request body must contain repo_url"})
 		return
 	}
 
-	repoURL := strings.TrimSpace(req.RepoURL)
-	// Strip trailing .git for display, keep it for cloning
-	displayURL := strings.TrimSuffix(repoURL, ".git")
-	displayURL = strings.TrimSuffix(displayURL, "/")
-
-	if !githubURLPattern.MatchString(repoURL) {
-		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "invalid GitHub URL"})
+	repoURL, validationErr := sanitizeURL(strings.TrimSpace(req.RepoURL))
+	if validationErr != "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: validationErr})
 		return
 	}
+
+	displayURL := strings.TrimSuffix(repoURL, ".git")
+	displayURL = strings.TrimSuffix(displayURL, "/")
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), scanTimeout)
 	defer cancel()
