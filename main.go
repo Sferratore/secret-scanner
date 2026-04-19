@@ -3,22 +3,27 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bl4ckw1ng/secret-scanner/api"
+	"github.com/bl4ckw1ng/secret-scanner/models"
 	"github.com/gin-gonic/gin"
 )
 
 // Config maps directly to config.json.
 type Config struct {
-	Port           string   `json:"port"`
-	AllowedOrigins []string `json:"allowed_origins"`
-	AllowedMethods []string `json:"allowed_methods"`
-	AllowedHeaders []string `json:"allowed_headers"`
-	ScanTimeoutSecs int     `json:"scan_timeout_secs"`
-	MaxFileSizeMB  int      `json:"max_file_size_mb"`
+	Port            string   `json:"port"`
+	AllowedOrigins  []string `json:"allowed_origins"`
+	AllowedMethods  []string `json:"allowed_methods"`
+	AllowedHeaders  []string `json:"allowed_headers"`
+	ScanTimeoutSecs int      `json:"scan_timeout_secs"`
+	MaxFileSizeMB   int      `json:"max_file_size_mb"`
+	RateLimit       int      `json:"rate_limit"`       // max requests per window per IP
+	RateWindowSecs  int      `json:"rate_window_secs"` // window duration in seconds
 }
 
 func loadConfig(path string) Config {
@@ -29,6 +34,8 @@ func loadConfig(path string) Config {
 		AllowedHeaders:  []string{"Content-Type", "Authorization"},
 		ScanTimeoutSecs: 300,
 		MaxFileSizeMB:   1,
+		RateLimit:       5,
+		RateWindowSecs:  60,
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -57,7 +64,7 @@ func main() {
 
 	apiGroup := router.Group("/api")
 	{
-		apiGroup.POST("/scan", api.ScanHandler)
+		apiGroup.POST("/scan", rateLimiter(cfg), api.ScanHandler)
 	}
 
 	log.Printf("Secret Scanner API listening on :%s", cfg.Port)
@@ -78,6 +85,61 @@ func requestLogger() gin.HandlerFunc {
 			c.Writer.Status(),
 			time.Since(start),
 		)
+	}
+}
+
+// rateLimiter tracks requests per IP using a sliding window.
+func rateLimiter(cfg Config) gin.HandlerFunc {
+	type visitor struct {
+		count    int
+		windowStart time.Time
+	}
+
+	var mu sync.Mutex
+	visitors := make(map[string]*visitor)
+	window := time.Duration(cfg.RateWindowSecs) * time.Second
+
+	// Clean up stale entries every window duration
+	go func() {
+		for {
+			time.Sleep(window)
+			mu.Lock()
+			for ip, v := range visitors {
+				if time.Since(v.windowStart) > window {
+					delete(visitors, ip)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+
+	return func(c *gin.Context) {
+		ip := c.ClientIP()
+
+		mu.Lock()
+		v, exists := visitors[ip]
+		now := time.Now()
+
+		if !exists || now.Sub(v.windowStart) > window {
+			// New window
+			visitors[ip] = &visitor{count: 1, windowStart: now}
+			mu.Unlock()
+			c.Next()
+			return
+		}
+
+		v.count++
+		if v.count > cfg.RateLimit {
+			mu.Unlock()
+			c.JSON(http.StatusTooManyRequests, models.ErrorResponse{
+				Error: "rate limit exceeded, try again later",
+			})
+			c.Abort()
+			return
+		}
+
+		mu.Unlock()
+		c.Next()
 	}
 }
 

@@ -4,5 +4,7 @@
   "allowed_methods": ["GET", "POST", "OPTIONS"],
   "allowed_headers": ["Content-Type", "Authorization"],
   "scan_timeout_secs": 300,
-  "max_file_size_mb": 1
+  "max_file_size_mb": 1,
+  "rate_limit": 5,
+  "rate_window_secs": 60
 }
