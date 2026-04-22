@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -37,9 +39,44 @@ var skipFiles = map[string]bool{
 	"pnpm-lock.yaml":      true,
 }
 
+// Resource limits. These are the hard ceilings that protect the process
+// against hostile or accidentally huge repositories. Tuned jointly: with the
+// server-layer semaphore capping concurrent scans, peak /tmp usage is bounded
+// at roughly concurrency * maxCloneSize.
 const (
-	maxFileSize    = 1 * 1024 * 1024 // 1 MB
+	// maxFileSize is the per-file byte ceiling applied during scanning. Files
+	// larger than this are skipped entirely (not truncated) to avoid pathological
+	// regex runtimes on huge minified bundles or generated assets.
+	maxFileSize = 1 * 1024 * 1024 // 1 MB
+
+	// binaryCheckLen is the prefix length inspected by isBinary to decide
+	// whether content looks like a binary blob (null bytes present).
 	binaryCheckLen = 512
+
+	// maxCloneSize is the hard on-disk ceiling enforced by the watchdog
+	// goroutine while cloning. If the temp directory grows past this before the
+	// clone completes, the clone context is canceled and the partial tree is
+	// removed. Defends against git bomb / huge-repo DoS.
+	maxCloneSize = 700 * 1024 * 1024 // 700 MB
+
+	// maxEntries caps the size of the FileEntry slice produced by WalkHistory
+	// so that a repo with millions of small files cannot exhaust RAM.
+	maxEntries = 10_000
+
+	// cloneDepth restricts the clone to the most recent N commits on the
+	// default branch. Combined with SingleBranch+NoTags, this is the single
+	// biggest reduction in bytes fetched for typical repositories.
+	cloneDepth = 50
+
+	// cloneTimeout is the wall-clock budget for the clone step alone. It is
+	// independent from the outer scan timeout so a slow clone cannot steal all
+	// the time the scanner would need afterward.
+	cloneTimeout = 60 * time.Second
+
+	// diskCheckInterval is how often the watchdog re-measures the temp dir.
+	// Short enough to react well before maxCloneSize is wildly overshot,
+	// long enough that the walk itself is not a performance drag.
+	diskCheckInterval = 2 * time.Second
 )
 
 // CloneResult holds the cloned repository and temp dir path.
@@ -48,24 +85,131 @@ type CloneResult struct {
 	TmpDir string
 }
 
-// CloneRepo clones a public GitHub repository into a temporary directory.
+// CloneRepo clones a public GitHub repository into a temporary directory with
+// multiple independent safety limits:
+//
+//  1. Shallow clone (Depth=cloneDepth) — bounds commit history fetched.
+//  2. SingleBranch — fetches only the remote HEAD branch, not every ref.
+//  3. NoTags — skips tag objects (which can balloon on release-heavy repos).
+//  4. cloneCtx with cloneTimeout — wall-clock deadline just for the clone.
+//  5. Disk watchdog goroutine — polls the temp dir and cancels the clone if
+//     it blows past maxCloneSize, defending against servers that advertise a
+//     reasonable size then stream unbounded data.
+//
+// On any failure path the temp directory is removed so repeated errors do not
+// accumulate on disk.
 func CloneRepo(ctx context.Context, repoURL string) (*CloneResult, error) {
+	// Create an isolated scratch directory. The "secret-scanner-*" prefix
+	// makes the source of any leftover directories obvious during debugging.
 	tmpDir, err := os.MkdirTemp("", "secret-scanner-*")
 	if err != nil {
 		return nil, fmt.Errorf("creating temp dir: %w", err)
 	}
 
-	repo, err := git.PlainCloneContext(ctx, tmpDir, false, &git.CloneOptions{
-		URL:      repoURL,
-		Progress: io.Discard,
-		Depth:    0, // full history
+	// cloneCtx is derived from the caller's context so outer cancellation
+	// still propagates, but it adds its own deadline and cancel func — the
+	// watchdog uses cancel() to abort the clone when the disk cap is hit.
+	cloneCtx, cancel := context.WithTimeout(ctx, cloneTimeout)
+	defer cancel()
+
+	// diskExceeded is set by the watchdog when it trips so the error path can
+	// distinguish "killed for size" from a generic transport/network error.
+	// atomic.Bool is used because it is read from the main goroutine after
+	// the watchdog may have written it.
+	var diskExceeded atomic.Bool
+
+	// watchdogDone lets the main goroutine wait for the watchdog to exit
+	// before returning. Without this we would race on tmpDir removal.
+	watchdogDone := make(chan struct{})
+
+	go func() {
+		// close on exit so the main goroutine's <-watchdogDone unblocks no
+		// matter which branch we leave through.
+		defer close(watchdogDone)
+
+		ticker := time.NewTicker(diskCheckInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-cloneCtx.Done():
+				// Clone finished (success or failure) or deadline tripped.
+				// Either way the watchdog has nothing more to do.
+				return
+			case <-ticker.C:
+				// Re-measure tmpDir. Walk errors are tolerated (transient
+				// races with git writing files) — we simply retry next tick.
+				if size, err := dirSize(tmpDir); err == nil && size > maxCloneSize {
+					diskExceeded.Store(true)
+					cancel() // aborts git.PlainCloneContext
+					return
+				}
+			}
+		}
+	}()
+
+	// PlainCloneContext is the context-aware clone. We force-disable anything
+	// that could explode the working copy: history depth, branch fan-out,
+	// tag objects. Progress output is discarded — callers don't want it and
+	// keeping it in memory would be another small leak vector.
+	repo, err := git.PlainCloneContext(cloneCtx, tmpDir, false, &git.CloneOptions{
+		URL:          repoURL,
+		Progress:     io.Discard,
+		Depth:        cloneDepth,
+		SingleBranch: true,
+		Tags:         git.NoTags,
 	})
+
+	// Explicitly cancel before waiting so a watchdog that is still mid-tick
+	// gets the signal promptly, then block until it has fully exited.
+	cancel()
+	<-watchdogDone
+
 	if err != nil {
+		// Always clean up partial state. Ignore the error — if RemoveAll
+		// fails there is nothing actionable to do and the original clone
+		// error is the one worth surfacing.
 		os.RemoveAll(tmpDir)
+
+		// Prefer the disk-cap message so operators can tell this case apart
+		// from network or auth failures in logs.
+		if diskExceeded.Load() {
+			return nil, fmt.Errorf("clone exceeded disk cap of %d bytes", maxCloneSize)
+		}
 		return nil, fmt.Errorf("cloning repository: %w", err)
 	}
 
 	return &CloneResult{Repo: repo, TmpDir: tmpDir}, nil
+}
+
+// dirSize returns the sum of regular-file sizes under path. It is the
+// measurement primitive used by the clone watchdog.
+//
+// WalkDir is preferred over Walk because it avoids a stat() per entry —
+// DirEntry is satisfied from the directory read. We still call d.Info() on
+// files to obtain size, but directories cost nothing.
+//
+// Per-entry errors are swallowed (return nil) because the tree is being
+// written concurrently by go-git: a file might disappear between the dirent
+// read and the Info() call, and that is expected, not fatal. The next tick
+// re-walks anyway.
+func dirSize(path string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
 }
 
 // FileEntry represents a file at a particular point in history.

@@ -36,23 +36,33 @@ type ScanResult struct {
 }
 
 // Scan clones repoURL and scans its full history and HEAD tree.
+// It orchestrates the full pipeline: clone -> history walk -> per-file pattern scan -> dedupe.
+// The ctx is honored between entries so long scans can be cancelled or time out cleanly.
 func Scan(ctx context.Context, repoURL string) (*ScanResult, error) {
+	// Clone into a temporary directory; CloneRepo returns the path and metadata.
 	cloneResult, err := CloneRepo(ctx, repoURL)
 	if err != nil {
 		return nil, err
 	}
+	// Always remove the temp clone when we're done, even on error paths below.
 	defer os.RemoveAll(cloneResult.TmpDir)
 
+	// WalkHistory flattens the repo into a list of FileEntry values, one per
+	// (commit, file) pair plus the HEAD tree, along with the total commit count.
 	entries, commitCount, err := WalkHistory(ctx, cloneResult)
 	if err != nil {
 		return nil, err
 	}
 
+	// seen dedupes findings across the whole scan so the same secret isn't
+	// reported once per commit that carried it forward.
 	seen := make(map[dedupeKey]bool)
 	var findings []models.Finding
+	// filesSeen tracks unique file paths touched, used for TotalFilesScanned stats.
 	filesSeen := make(map[string]bool)
 
 	for _, entry := range entries {
+		// Check cancellation between entries so we don't keep scanning after timeout.
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("scan timeout exceeded")
@@ -60,6 +70,8 @@ func Scan(ctx context.Context, repoURL string) (*ScanResult, error) {
 		}
 
 		filesSeen[entry.Path] = true
+		// Delegate the actual regex matching to scanContent; it mutates `seen`
+		// so duplicates found in later entries are skipped.
 		entryFindings := scanContent(entry, seen)
 		findings = append(findings, entryFindings...)
 	}
@@ -72,18 +84,27 @@ func Scan(ctx context.Context, repoURL string) (*ScanResult, error) {
 }
 
 // scanContent runs all patterns against a single FileEntry.
+// It scans line-by-line so we can report accurate line numbers and per-line context.
+// The seen map is shared with the caller so dedupe spans the entire scan, not just this file.
 func scanContent(entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
+	// Split once up-front; reused for matching and for extractContext below.
 	lines := strings.Split(string(entry.Content), "\n")
 	var findings []models.Finding
 
+	// CommitDate is typed as any on FileEntry; fall back to zero time if absent.
 	commitDate, _ := entry.CommitDate.(time.Time)
 
 	for lineIdx, line := range lines {
+		// Try every known pattern on each line. Patterns come from the package-level registry.
 		for _, pattern := range Patterns {
+			// Use indices (not strings) so we can recover the original slice bounds
+			// and decide between the full match and capture group 1.
 			matches := pattern.Regex.FindAllStringSubmatchIndex(line, -1)
 			for _, match := range matches {
-				// Extract the captured group (subgroup 1 if present, otherwise full match)
+				// Default to the full match span (group 0).
 				start, end := match[0], match[1]
+				// If the pattern defines a capture group, prefer it — that's where
+				// the secret value lives (the surrounding text is just the anchor).
 				if len(match) >= 4 && match[2] >= 0 {
 					start, end = match[2], match[3]
 				}
@@ -93,23 +114,28 @@ func scanContent(entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
 					continue
 				}
 
-				// Skip placeholders
+				// Skip values that look like placeholders (e.g. "xxx", "<your-key-here>").
 				if IsPlaceholder(raw) {
 					continue
 				}
 
-				// Skip lines that are clearly regex/code definitions, not real secrets
+				// Skip lines that are clearly regex/code definitions, not real secrets.
+				// This filters out pattern registries, tests, and examples.
 				if falsePositivePattern.MatchString(line) {
 					continue
 				}
 
+				// Mask before dedupe so the key itself never holds raw secret material.
 				masked := maskSecret(raw)
+				// Dedupe is per (pattern, masked value, file) — the same secret at
+				// the same path across many commits collapses to one finding.
 				key := dedupeKey{patternID: pattern.ID, masked: masked, file: entry.Path}
 				if seen[key] {
 					continue
 				}
 				seen[key] = true
 
+				// Grab surrounding lines for reviewer context in the report.
 				contextStr := extractContext(lines, lineIdx)
 
 				findings = append(findings, models.Finding{
@@ -118,7 +144,7 @@ func scanContent(entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
 					Severity:      pattern.Severity,
 					Description:   pattern.Description,
 					File:          entry.Path,
-					Line:          lineIdx + 1,
+					Line:          lineIdx + 1, // report 1-indexed lines to match editors
 					Commit:        entry.CommitHash,
 					CommitMessage: truncate(entry.CommitMessage, 120),
 					CommitAuthor:  entry.CommitAuthor,
