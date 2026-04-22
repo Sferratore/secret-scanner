@@ -19,7 +19,20 @@ const (
 	scanTimeout = 5 * time.Minute
 	maxURLLen   = 256
 	maxBodySize = 1024 // 1 KB — a repo_url JSON doesn't need more
+
+	// maxConcurrentScans bounds how many scans may run at the same time
+	// across the whole process. Each in-flight scan can hold up to
+	// maxCloneSize on disk plus regex CPU, so this is the integration point
+	// that turns the per-scan caps into a global resource ceiling
+	// (concurrency × maxCloneSize ≈ peak /tmp). Excess requests fast-fail
+	// with 503 rather than queueing.
+	maxConcurrentScans = 3
 )
+
+// scanSlots is a counting semaphore implemented as a buffered channel.
+// A send acquires a slot; a receive releases one. Non-blocking acquire
+// (select with default) gives fast-fail behaviour under load.
+var scanSlots = make(chan struct{}, maxConcurrentScans)
 
 // githubURLPattern validates GitHub repository URLs after all other checks pass.
 var githubURLPattern = regexp.MustCompile(
@@ -106,6 +119,19 @@ func ScanHandler(c *gin.Context) {
 
 	displayURL := strings.TrimSuffix(repoURL, ".git")
 	displayURL = strings.TrimSuffix(displayURL, "/")
+
+	// Acquire a scan slot or fast-fail. Done after cheap validation so
+	// invalid requests don't burn capacity, but before any expensive work
+	// (clone, scan) is started.
+	select {
+	case scanSlots <- struct{}{}:
+		defer func() { <-scanSlots }()
+	default:
+		c.JSON(http.StatusServiceUnavailable, models.ErrorResponse{
+			Error: "scanner busy, please retry shortly",
+		})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), scanTimeout)
 	defer cancel()
