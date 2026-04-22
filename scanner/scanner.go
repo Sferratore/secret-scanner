@@ -20,6 +20,21 @@ import (
 // any realistic config line that would carry a token.
 const maxLineLength = 4 * 1024
 
+// Output-side caps. Independent from the input/work caps (maxEntries,
+// maxLineLength) — a single file can still match many patterns, and many
+// files can each match a few. These bound the report size so memory and
+// response payload stay sane even on dump-style repositories.
+const (
+	// maxFindingsPerFile caps how many findings one FileEntry can contribute.
+	// A single leaked secrets file shouldn't dominate the whole report.
+	maxFindingsPerFile = 50
+
+	// maxTotalFindings is the scan-wide ceiling. Once reached, remaining
+	// entries are skipped — partial results are still returned to the caller.
+	// Far above any volume a human reviewer would triage manually.
+	maxTotalFindings = 1000
+)
+
 // falsePositivePattern matches lines that are clearly code defining patterns,
 // not actual secrets (e.g. regexp definitions, test fixtures, comments).
 var falsePositivePattern = regexp.MustCompile(
@@ -81,6 +96,13 @@ func Scan(ctx context.Context, repoURL string) (*ScanResult, error) {
 		// so duplicates found in later entries are skipped.
 		entryFindings := scanContent(entry, seen)
 		findings = append(findings, entryFindings...)
+
+		// Scan-wide findings ceiling — stop processing further entries once
+		// the report is already as full as we're willing to ship. Partial
+		// results are still returned.
+		if len(findings) >= maxTotalFindings {
+			break
+		}
 	}
 
 	return &ScanResult{
@@ -101,6 +123,7 @@ func scanContent(entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
 	// CommitDate is typed as any on FileEntry; fall back to zero time if absent.
 	commitDate, _ := entry.CommitDate.(time.Time)
 
+linesLoop:
 	for lineIdx, line := range lines {
 		// Skip pathologically long lines before any regex runs. Avoids
 		// catastrophic backtracking on minified/blob content.
@@ -164,6 +187,13 @@ func scanContent(entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
 					MatchedValue:  masked,
 					Context:       contextStr,
 				})
+
+				// Per-file cap: stop scanning this entry once it has produced
+				// enough findings on its own. The labeled break exits all
+				// three nested loops at once.
+				if len(findings) >= maxFindingsPerFile {
+					break linesLoop
+				}
 			}
 		}
 	}
