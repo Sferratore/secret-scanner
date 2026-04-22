@@ -3,6 +3,7 @@ package scanner
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,12 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
+
+// errEntryLimit is a sentinel returned from inner ForEach callbacks to stop
+// iteration once the entries slice has hit maxEntries. It is never surfaced
+// to callers — the outer loop converts it to a clean early return so the
+// partial result set is still usable.
+var errEntryLimit = errors.New("entry limit reached")
 
 // skipExtensions lists file extensions that never contain secrets.
 var skipExtensions = map[string]bool{
@@ -253,6 +260,11 @@ func WalkHistory(ctx context.Context, result *CloneResult) ([]FileEntry, int, er
 		default:
 		}
 
+		// Cap reached — no point walking further refs.
+		if len(entries) >= maxEntries {
+			break
+		}
+
 		logOpts := &git.LogOptions{From: refHash, Order: git.LogOrderCommitterTime}
 		commitIter, err := repo.Log(logOpts)
 		if err != nil {
@@ -264,6 +276,11 @@ func WalkHistory(ctx context.Context, result *CloneResult) ([]FileEntry, int, er
 			case <-ctx.Done():
 				return fmt.Errorf("timeout")
 			default:
+			}
+
+			// Stop the whole iteration once we've collected enough entries.
+			if len(entries) >= maxEntries {
+				return errEntryLimit
 			}
 
 			if seenCommits[c.Hash] {
@@ -294,6 +311,11 @@ func WalkHistory(ctx context.Context, result *CloneResult) ([]FileEntry, int, er
 
 			if changes != nil {
 				for _, change := range changes {
+					// Re-check the cap inside the inner loop — one commit can
+					// touch tens of thousands of files on its own.
+					if len(entries) >= maxEntries {
+						return errEntryLimit
+					}
 					// Skip deletes
 					if change.To.Name == "" {
 						continue
@@ -328,6 +350,9 @@ func WalkHistory(ctx context.Context, result *CloneResult) ([]FileEntry, int, er
 			} else if parentTree == nil {
 				// Initial commit — scan all files
 				currentTree.Files().ForEach(func(f *object.File) error {
+					if len(entries) >= maxEntries {
+						return errEntryLimit
+					}
 					if shouldSkipFile(f.Name) {
 						return nil
 					}
@@ -357,6 +382,16 @@ func WalkHistory(ctx context.Context, result *CloneResult) ([]FileEntry, int, er
 		if err != nil && strings.Contains(err.Error(), "timeout") {
 			return entries, commitCount, fmt.Errorf("scan timeout exceeded")
 		}
+		// Cap was hit inside the inner ForEach — stop walking refs.
+		if errors.Is(err, errEntryLimit) {
+			break
+		}
+	}
+
+	// If we already filled the budget from history, skip the HEAD walk
+	// rather than overshoot the cap.
+	if len(entries) >= maxEntries {
+		return entries, commitCount, nil
 	}
 
 	// Walk HEAD file tree (current state)
@@ -380,6 +415,10 @@ func WalkHistory(ctx context.Context, result *CloneResult) ([]FileEntry, int, er
 		case <-ctx.Done():
 			return fmt.Errorf("timeout")
 		default:
+		}
+
+		if len(entries) >= maxEntries {
+			return errEntryLimit
 		}
 
 		if shouldSkipFile(f.Name) {
