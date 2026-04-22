@@ -35,6 +35,18 @@ const (
 	maxTotalFindings = 1000
 )
 
+// perFileTimeout is the wall-clock budget for scanning a single FileEntry.
+// Backstops regex pathologies that maxLineLength doesn't catch (e.g. many
+// medium-length lines all triggering backtracking) and prevents one file
+// from monopolising the parent scan budget.
+const perFileTimeout = 3 * time.Second
+
+// ctxCheckStride is how often (in lines) the per-file scan loop polls its
+// context. Power-of-two so the bitmask check is cheap. Tuned so the select
+// cost is invisible on small files but gives sub-second cancel response on
+// large ones.
+const ctxCheckStride = 256
+
 // falsePositivePattern matches lines that are clearly code defining patterns,
 // not actual secrets (e.g. regexp definitions, test fixtures, comments).
 var falsePositivePattern = regexp.MustCompile(
@@ -93,8 +105,10 @@ func Scan(ctx context.Context, repoURL string) (*ScanResult, error) {
 
 		filesSeen[entry.Path] = true
 		// Delegate the actual regex matching to scanContent; it mutates `seen`
-		// so duplicates found in later entries are skipped.
-		entryFindings := scanContent(entry, seen)
+		// so duplicates found in later entries are skipped. ctx is passed
+		// through so per-file deadlines and parent cancellation both bite
+		// mid-file rather than waiting for the next entry boundary.
+		entryFindings := scanContent(ctx, entry, seen)
 		findings = append(findings, entryFindings...)
 
 		// Scan-wide findings ceiling — stop processing further entries once
@@ -115,7 +129,14 @@ func Scan(ctx context.Context, repoURL string) (*ScanResult, error) {
 // scanContent runs all patterns against a single FileEntry.
 // It scans line-by-line so we can report accurate line numbers and per-line context.
 // The seen map is shared with the caller so dedupe spans the entire scan, not just this file.
-func scanContent(entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
+// ctx carries the parent scan's deadline; a per-file sub-context layered on top
+// caps the work this single entry is allowed to do.
+func scanContent(ctx context.Context, entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
+	// Per-file deadline — bounds any single entry independently from the
+	// parent scan timeout, so one bad file can't starve the rest of the repo.
+	fileCtx, cancel := context.WithTimeout(ctx, perFileTimeout)
+	defer cancel()
+
 	// Split once up-front; reused for matching and for extractContext below.
 	lines := strings.Split(string(entry.Content), "\n")
 	var findings []models.Finding
@@ -125,6 +146,15 @@ func scanContent(entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
 
 linesLoop:
 	for lineIdx, line := range lines {
+		// Periodic cancel/deadline check. Stride keeps the select off the
+		// hot path for small files while still aborting large ones promptly.
+		if lineIdx%ctxCheckStride == 0 {
+			select {
+			case <-fileCtx.Done():
+				break linesLoop
+			default:
+			}
+		}
 		// Skip pathologically long lines before any regex runs. Avoids
 		// catastrophic backtracking on minified/blob content.
 		if len(line) > maxLineLength {
