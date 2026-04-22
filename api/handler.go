@@ -24,9 +24,14 @@ const (
 	// across the whole process. Each in-flight scan can hold up to
 	// maxCloneSize on disk plus regex CPU, so this is the integration point
 	// that turns the per-scan caps into a global resource ceiling
-	// (concurrency × maxCloneSize ≈ peak /tmp). Excess requests fast-fail
-	// with 503 rather than queueing.
+	// (concurrency × maxCloneSize ≈ peak /tmp).
 	maxConcurrentScans = 3
+
+	// scanQueueWait is how long an incoming request will wait for an
+	// in-flight scan to release a slot before giving up with 503. Short
+	// enough that waiters don't accumulate under sustained overload, long
+	// enough to absorb the common case of a scan finishing within seconds.
+	scanQueueWait = 10 * time.Second
 )
 
 // scanSlots is a counting semaphore implemented as a buffered channel.
@@ -120,13 +125,18 @@ func ScanHandler(c *gin.Context) {
 	displayURL := strings.TrimSuffix(repoURL, ".git")
 	displayURL = strings.TrimSuffix(displayURL, "/")
 
-	// Acquire a scan slot or fast-fail. Done after cheap validation so
-	// invalid requests don't burn capacity, but before any expensive work
-	// (clone, scan) is started.
+	// Acquire a scan slot, waiting up to scanQueueWait. Done after cheap
+	// validation so invalid requests don't burn capacity, but before any
+	// expensive work (clone, scan) is started. The wait sub-context is
+	// derived from the request context so a client disconnect releases the
+	// waiter immediately instead of holding a goroutine for the full wait.
+	waitCtx, waitCancel := context.WithTimeout(c.Request.Context(), scanQueueWait)
 	select {
 	case scanSlots <- struct{}{}:
+		waitCancel()
 		defer func() { <-scanSlots }()
-	default:
+	case <-waitCtx.Done():
+		waitCancel()
 		c.JSON(http.StatusServiceUnavailable, models.ErrorResponse{
 			Error: "scanner busy, please retry shortly",
 		})
