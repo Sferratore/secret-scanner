@@ -13,6 +13,13 @@ import (
 	"github.com/google/uuid"
 )
 
+// maxLineLength is the per-line byte ceiling applied during scanning. Lines
+// longer than this are skipped entirely. This defends against catastrophic
+// regex backtracking on minified bundles, base64 blobs, and log dumps —
+// inputs where no legitimate secret would live anyway. 4 KB is well above
+// any realistic config line that would carry a token.
+const maxLineLength = 4 * 1024
+
 // falsePositivePattern matches lines that are clearly code defining patterns,
 // not actual secrets (e.g. regexp definitions, test fixtures, comments).
 var falsePositivePattern = regexp.MustCompile(
@@ -95,6 +102,11 @@ func scanContent(entry FileEntry, seen map[dedupeKey]bool) []models.Finding {
 	commitDate, _ := entry.CommitDate.(time.Time)
 
 	for lineIdx, line := range lines {
+		// Skip pathologically long lines before any regex runs. Avoids
+		// catastrophic backtracking on minified/blob content.
+		if len(line) > maxLineLength {
+			continue
+		}
 		// Try every known pattern on each line. Patterns come from the package-level registry.
 		for _, pattern := range Patterns {
 			// Use indices (not strings) so we can recover the original slice bounds
