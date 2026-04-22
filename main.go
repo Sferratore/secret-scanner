@@ -67,8 +67,27 @@ func main() {
 		apiGroup.POST("/scan", rateLimiter(cfg), api.ScanHandler)
 	}
 
+	// Explicit http.Server with timeouts on every phase. Gin's router.Run
+	// uses Go's defaults (no timeouts), which leaves the process open to
+	// slowloris-style attacks: a client trickling headers or reading the
+	// response one byte at a time holds a goroutine and a connection
+	// indefinitely, bypassing both the per-IP rate limiter and the scan
+	// semaphore (those only apply once the handler runs).
+	//
+	// WriteTimeout must outlast api.scanTimeout (5m) plus the queue wait
+	// budget (10s), since the response is written after the scan returns.
+	// 5m30s gives a safety margin for the handler's own JSON encode.
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      5*time.Minute + 30*time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
 	log.Printf("Secret Scanner API listening on :%s", cfg.Port)
-	if err := router.Run(":" + cfg.Port); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
