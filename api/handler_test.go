@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -175,4 +176,50 @@ func TestScanHandlerBodySizeLimit(t *testing.T) {
 			t.Fatalf("handler took %v, want < 1s (MaxBytesReader may not trip early)", elapsed)
 		}
 	})
+}
+
+func TestScanHandlerSaturated503(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/scan", ScanHandler)
+
+	// Fill every slot. scanSlots is a buffered channel of capacity
+	// maxConcurrentScans — three non-blocking sends take all seats.
+	for range maxConcurrentScans {
+		scanSlots <- struct{}{}
+	}
+	// Restore state so subsequent tests are not starved.
+	defer func() {
+		for range maxConcurrentScans {
+			<-scanSlots
+		}
+	}()
+
+	// Valid GitHub URL — passes sanitizeURL, so we reach the semaphore
+	// acquisition step. We then rely on the client-disconnect path (a
+	// canceled request context) to short-circuit the 10s queue wait,
+	// keeping the test fast while still asserting the 503 response path.
+	body := []byte(`{"repo_url":"https://github.com/owner/repo"}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/scan", bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	start := time.Now()
+	router.ServeHTTP(w, req)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%q)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "scanner busy") {
+		t.Fatalf("response body = %q, want 'scanner busy' substring", w.Body.String())
+	}
+	// Canceled parent context must abort the wait immediately — not
+	// consume the full scanQueueWait (10s). 1s is a generous bound.
+	if elapsed > time.Second {
+		t.Fatalf("handler took %v, want < 1s (client-disconnect did not abort wait)", elapsed)
+	}
 }
