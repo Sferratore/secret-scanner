@@ -1,8 +1,14 @@
 package api
 
 import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestSanitizeURL(t *testing.T) {
@@ -78,4 +84,95 @@ func TestSanitizeURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Builds a JSON body of exactly n bytes by padding the repo_url value with 'x'.
+// For n < overhead, returns n whitespace bytes instead.
+func bodyOfSize(n int) []byte {
+	const prefix = `{"repo_url":"`
+	const suffix = `"}`
+	overhead := len(prefix) + len(suffix)
+	if n < overhead {
+		return []byte(strings.Repeat(" ", n))
+	}
+	return []byte(prefix + strings.Repeat("x", n-overhead) + suffix)
+}
+
+func TestScanHandlerBodySizeLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/scan", ScanHandler)
+
+	tests := []struct {
+		name       string
+		body       []byte
+		wantStatus int
+		wantErrSub string
+	}{
+		{
+			name:       "empty body",
+			body:       []byte{},
+			wantStatus: http.StatusBadRequest,
+			wantErrSub: "request body must contain repo_url",
+		},
+		{
+			name:       "well-formed json under limit, bad host — size gate passes",
+			body:       []byte(`{"repo_url":"https://gitlab.com/a/b"}`),
+			wantStatus: http.StatusBadRequest,
+			wantErrSub: "github.com",
+		},
+		{
+			name:       "exactly at limit (1024 bytes) — size gate still passes",
+			body:       bodyOfSize(1024),
+			wantStatus: http.StatusBadRequest,
+			wantErrSub: "URL too long",
+		},
+		{
+			name:       "over limit (2 KB) — size gate rejects",
+			body:       bodyOfSize(2048),
+			wantStatus: http.StatusBadRequest,
+			wantErrSub: "request body must contain repo_url",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/scan", bytes.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			router.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body=%q)", w.Code, tc.wantStatus, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), tc.wantErrSub) {
+				t.Fatalf("response body = %q, want substring %q", w.Body.String(), tc.wantErrSub)
+			}
+		})
+	}
+
+	t.Run("1 MB body rejected quickly (not buffered)", func(t *testing.T) {
+		body := bodyOfSize(1024 * 1024)
+		req := httptest.NewRequest(http.MethodPost, "/api/scan", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		start := time.Now()
+		router.ServeHTTP(w, req)
+		elapsed := time.Since(start)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body=%q)", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "request body must contain repo_url") {
+			t.Fatalf("response body = %q, want size-rejection message", w.Body.String())
+		}
+		// Soft upper bound — if MaxBytesReader regresses and the body gets
+		// fully buffered/parsed, this will blow well past 1s. Generous
+		// margin so CI jitter doesn't cause flakes.
+		if elapsed > time.Second {
+			t.Fatalf("handler took %v, want < 1s (MaxBytesReader may not trip early)", elapsed)
+		}
+	})
 }
