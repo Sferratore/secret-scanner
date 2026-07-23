@@ -12,15 +12,6 @@ A stateless REST API written in Go that scans public GitHub repositories for sec
 6. Deduplicates findings, masks secret values, and returns a structured JSON report.
 7. Removes the temporary clone automatically on every exit path.
 
-## Tech Stack
-
-| Component | Library |
-|-----------|---------|
-| Language | Go 1.22 |
-| HTTP Framework | [Gin](https://github.com/gin-gonic/gin) |
-| Git operations | [go-git](https://github.com/go-git/go-git) |
-| UUID generation | [google/uuid](https://github.com/google/uuid) |
-
 ## Project Structure
 
 ```
@@ -95,7 +86,7 @@ curl -X POST http://localhost:8080/api/scan \
   -d '{"repo_url": "https://github.com/trufflesecurity/test_keys"}'
 ```
 
-Responses come back as a single JSON object (no streaming). Small repos return in under a second; a maxed-out scan can take up to 5 minutes.
+Responses come back as a single JSON object.
 
 ### 6. Interpret the response
 
@@ -112,12 +103,12 @@ For triage, sort by `severity` (`critical` → `high` → `medium`) then by `com
 | You see | It means |
 |---------|----------|
 | `400 request body must contain repo_url` | Empty or malformed JSON, or body over 1 KB |
-| `400 only github.com repositories are supported` | URL did not pass the allowlist — check scheme, host, credentials, query params |
-| `404 repository not found or private` | Repo does not exist or requires authentication — private repos are unsupported |
+| `400 only github.com repositories are supported` | URL did not pass the allowlist. Check scheme, host, credentials, query params |
+| `404 repository not found or private` | Repo does not exist or requires authentication (private repos are unsupported). |
 | `408 scan timeout` | Scan exceeded 5 minutes |
 | `429 rate limit exceeded, try again later` | Your IP exhausted its quota for the current window |
 | `503 scanner busy, please retry shortly` | All concurrent scan slots were occupied for the full 10 s queue wait |
-| `500 internal scan error` | Unexpected failure — check server logs |
+| `500 internal scan error` | Unexpected failure, check server logs |
 
 ## API Reference
 
@@ -176,7 +167,7 @@ Scan a public GitHub repository.
 
 ## Software Specs
 
-Every limit below is enforced in code. They are tuned jointly so that peak disk and memory stay bounded under adversarial input (`maxConcurrentScans × maxCloneSize` is the worst case for `/tmp`).
+Every limit below is enforced in code. They are tuned jointly so that peak disk and memory stay bounded under adversarial input.
 
 ### Process-level
 
@@ -343,7 +334,7 @@ Every limit below is enforced in code. They are tuned jointly so that peak disk 
 - Private repositories are not supported.
 - Only the **most recent 50 commits of the default branch** are scanned (shallow, single-branch clone). Secrets committed and then rewritten before this window are not visible.
 - Pattern-based detection can produce false positives in test/example code; a small false-positive filter covers common cases (`regexp.MustCompile`, `example.com`, `test.*key`, and similar markers).
-- No persistent storage — each request is stateless and starts from a fresh clone.
+- No persistent storage. Each request is stateless and starts from a fresh clone.
 
 ## Testing
 
