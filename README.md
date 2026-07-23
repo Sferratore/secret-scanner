@@ -332,7 +332,7 @@ Every limit below is enforced in code. They are tuned jointly so that peak disk 
 
 - **Secret values are always masked**: only the first 4 and last 4 characters are shown; the middle is replaced with `*`.
 - Actual secret values are **never logged or stored**.
-- Only public repositories can be scanned — no authentication path exists.
+- Only public repositories can be scanned: no authentication path exists.
 - URL input is allowlisted through 11 validation rules before any clone is attempted (scheme, host, credentials, query, fragment, traversal, ASCII, length, null byte, final regex shape).
 - Request body is capped at 1 KB and rejected before JSON parsing if exceeded.
 - Per-IP rate limiting plus a global concurrency semaphore bound the blast radius of hostile callers.
@@ -355,10 +355,10 @@ go test ./... -count=1   # bypass the test cache
 
 The suite includes:
 
-- **URL sanitization** — 21 accept/reject cases (SSRF, protocol smuggling, host confusion, path traversal, unicode, null byte)
-- **Secret masking** — boundary cases, cap at 20 stars, unicode rune counting
-- **Core scan logic** — patterns, capture-group selection, dedupe (within/across files), placeholder filter, false-positive filter, per-file cap, long-line skip, 1-indexed line numbers
-- **Request body size limit** — including a 1 MB fast-reject timing check
-- **Per-IP rate limiter** — under limit, over limit, IP isolation, window rollover
-- **Concurrency semaphore** — 503 behaviour when all slots are held
-- **Full end-to-end run** — real go-git clone from a freshly seeded local repository, exercising the complete pipeline
+- **URL sanitization**: 21 accept/reject cases (SSRF, protocol smuggling, host confusion, path traversal, unicode, null byte)
+- **Secret masking**: boundary cases, cap at 20 stars, unicode rune counting
+- **Core scan logic**: patterns, capture-group selection, dedupe (within/across files), placeholder filter, false-positive filter, per-file cap, long-line skip, 1-indexed line numbers
+- **Request body size limit**: including a 1 MB fast-reject timing check
+- **Per-IP rate limiter**: under limit, over limit, IP isolation, window rollover
+- **Concurrency semaphore**: 503 behaviour when all slots are held
+- **Full end-to-end run**: real go-git clone from a freshly seeded local repository, exercising the complete pipeline
